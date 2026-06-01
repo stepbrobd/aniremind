@@ -1,0 +1,2 @@
+systems = ["aarch64-darwin"]
+substituters = ["https://cache.ysun.co"]

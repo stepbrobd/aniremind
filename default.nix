@@ -3,7 +3,7 @@
 swiftPackages.swift.stdenv.mkDerivation (finalAttrs: {
   meta.mainProgram = "aniremind";
   pname = "aniremind";
-  version = "2026.404.0";
+  version = "2026.815.0";
 
   src = ./.;
 

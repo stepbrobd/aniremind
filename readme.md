@@ -24,15 +24,18 @@ nix run github:stepbrobd/aniremind -- -u <username> -r <list> [-l <language>] [-
 already have a reminder. Never modifies existing reminders.
 
 **Force mode** (`--force`): additionally updates existing reminders whose airing
-schedule has changed (due date, recurrence, alarm).
+schedule has changed (due date, recurrence, alarm, timezone).
 
-Idempotent on re-run in both modes.
+Idempotent on re-run in both modes. If AniList returns an error (downtime, rate
+limit), the sync aborts with AniList's message before touching any reminders.
 
 Each reminder gets:
 
 - **Title**: AniList title in the selected language (native/english/romaji)
-- **Due date**: first upcoming episode air time, converted to local timezone
+- **Due date**: first upcoming episode air time, pinned to UTC and shown in your
+  local timezone
 - **Alarm**: at the due date
-- **Recurrence**: weekly until the last episode airs
+- **Recurrence**: weekly in UTC until the last episode airs, so occurrences stay
+  on the airing instant across DST changes
 - **URL**: AniList page for the show
 - **Notes**: episode count and date range

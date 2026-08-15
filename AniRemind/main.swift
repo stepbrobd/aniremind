@@ -1,6 +1,13 @@
 import EventKit
 import Foundation
 
+// MARK: - Failure
+
+struct Fail: Error, CustomStringConvertible {
+  let description: String
+  init(_ description: String) { self.description = description }
+}
+
 // MARK: - CLI
 
 enum TitleLanguage: String {
@@ -17,7 +24,7 @@ struct Config {
 func usage() -> Never {
   fputs(
     """
-    usage: AniRemind -u <username> -r <list> [--force]
+    usage: aniremind -u <username> -r <list> [-l <language>] [--force]
 
       -u, --user       AniList username
       -r, --reminder   Apple Reminders list name
@@ -112,8 +119,13 @@ struct QueryData: Decodable {
   let MediaListCollection: MediaListCollection?
 }
 
+struct GraphQLError: Decodable {
+  let message: String
+}
+
 struct GraphQLResponse: Decodable {
-  let data: QueryData
+  let data: QueryData?
+  let errors: [GraphQLError]?
 }
 
 func fetchWatchlist(username: String) throws -> [Entry] {
@@ -132,35 +144,34 @@ func fetchWatchlist(username: String) throws -> [Entry] {
     "query": query,
     "variables": ["userName": username],
   ]
-  let json = try JSONSerialization.data(withJSONObject: body)
-
   var req = URLRequest(url: URL(string: "https://graphql.anilist.co")!)
   req.httpMethod = "POST"
   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
   req.setValue("AniRemind/1.0", forHTTPHeaderField: "User-Agent")
-  req.httpBody = json
+  req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
   let sem = DispatchSemaphore(value: 0)
-  var result: Result<Data, Error>!
-
-  let task = URLSession.shared.dataTask(with: req) { data, _, error in
-    if let error = error {
-      result = .failure(error)
-    } else {
-      result = .success(data ?? Data())
-    }
+  var response: (data: Data?, error: Error?) = (nil, nil)
+  URLSession.shared.dataTask(with: req) { data, _, error in
+    response = (data, error)
     sem.signal()
-  }
-  task.resume()
+  }.resume()
   sem.wait()
 
-  let data = try result.get()
-  let resp = try JSONDecoder().decode(GraphQLResponse.self, from: data)
-  guard let collection = resp.data.MediaListCollection else {
-    fputs("error: user \"\(username)\" not found on anilist\n", stderr)
-    exit(1)
+  if let error = response.error {
+    throw Fail("anilist request failed: \(error.localizedDescription)")
   }
-  return collection.lists.flatMap { $0.entries }
+  guard let data = response.data else {
+    throw Fail("empty response from anilist")
+  }
+  let envelope = try JSONDecoder().decode(GraphQLResponse.self, from: data)
+  if let messages = envelope.errors?.map(\.message), !messages.isEmpty {
+    throw Fail("anilist: \(messages.joined(separator: "; "))")
+  }
+  guard let collection = envelope.data?.MediaListCollection else {
+    throw Fail("anilist returned no watchlist for user \"\(username)\"")
+  }
+  return collection.lists.flatMap(\.entries)
 }
 
 // MARK: - EventKit Helpers
@@ -184,84 +195,114 @@ func requestAccess(_ store: EKEventStore) -> Bool {
   return granted
 }
 
-func fetchReminders(_ store: EKEventStore, in list: EKCalendar) -> [EKReminder] {
-  let pred = store.predicateForReminders(in: [list])
+func fetchReminders(_ store: EKEventStore, in list: EKCalendar) throws -> [EKReminder] {
   let sem = DispatchSemaphore(value: 0)
-  var out: [EKReminder] = []
-  store.fetchReminders(matching: pred) { r in
-    out = r ?? []
+  var result: [EKReminder]?
+  store.fetchReminders(matching: store.predicateForReminders(in: [list])) { reminders in
+    result = reminders
     sem.signal()
   }
   sem.wait()
-  return out
+  guard let reminders = result else {
+    throw Fail("could not read reminders from \"\(list.title)\"")
+  }
+  return reminders
 }
 
-func findList(_ store: EKEventStore, name: String) -> EKCalendar {
+func findList(_ store: EKEventStore, name: String) throws -> EKCalendar {
   let calendars = store.calendars(for: .reminder)
-  guard let cal = calendars.first(where: { $0.title == name }) else {
-    let available = calendars.map { $0.title }.sorted().joined(separator: ", ")
-    fputs("error: reminder list \"\(name)\" not found\n", stderr)
-    fputs("available: \(available)\n", stderr)
-    exit(1)
+  guard let list = calendars.first(where: { $0.title == name }) else {
+    let available = calendars.map(\.title).sorted().joined(separator: ", ")
+    throw Fail("reminder list \"\(name)\" not found\navailable: \(available)")
   }
-  return cal
+  return list
 }
 
 // MARK: - Reminder Operations
 
-func configureReminder(
-  _ reminder: EKReminder,
-  media: Media,
-  nodes: [AiringNode],
-  fmt: DateFormatter
-) {
-  let startAt = Date(timeIntervalSince1970: TimeInterval(nodes.first!.airingAt))
-  let endAt = Date(timeIntervalSince1970: TimeInterval(nodes.last!.airingAt))
+struct Airing {
+  let episodes: Int
+  let start: Date
+  let end: Date
 
-  reminder.dueDateComponents = Calendar.current.dateComponents(
+  init?(_ nodes: [AiringNode]) {
+    guard let first = nodes.first, let last = nodes.last else { return nil }
+    episodes = nodes.count
+    start = Date(timeIntervalSince1970: TimeInterval(first.airingAt))
+    end = Date(timeIntervalSince1970: TimeInterval(last.airingAt))
+  }
+}
+
+func configure(_ reminder: EKReminder, media: Media, airing: Airing, fmt: DateFormatter) {
+  var cal = Calendar.current
+  cal.timeZone = .gmt
+  reminder.timeZone = .gmt
+  reminder.dueDateComponents = cal.dateComponents(
     [.year, .month, .day, .hour, .minute, .second, .timeZone],
-    from: startAt
+    from: airing.start
   )
 
   reminder.alarms?.forEach { reminder.removeAlarm($0) }
-  reminder.addAlarm(EKAlarm(absoluteDate: startAt))
+  reminder.addAlarm(EKAlarm(absoluteDate: airing.start))
 
   reminder.recurrenceRules = [
     EKRecurrenceRule(
       recurrenceWith: .weekly,
       interval: 1,
-      end: EKRecurrenceEnd(end: endAt)
+      end: EKRecurrenceEnd(end: airing.end)
     )
   ]
 
   reminder.url = URL(string: media.siteUrl)
   reminder.notes =
-    "\(nodes.count) episodes, \(fmt.string(from: startAt)) - \(fmt.string(from: endAt))"
+    "\(airing.episodes) episodes, \(fmt.string(from: airing.start)) - \(fmt.string(from: airing.end))"
+}
+
+func removeDuplicates(
+  _ store: EKEventStore, of media: Media, keeping title: String, in index: [String: [EKReminder]]
+) throws -> Int {
+  var removed = 0
+  for dupe in index[media.siteUrl, default: []] where dupe.title != title {
+    try store.remove(dupe, commit: false)
+    print("  delete: \(dupe.title ?? "(untitled)") (duplicate)")
+    removed += 1
+  }
+  return removed
 }
 
 func dueDate(of reminder: EKReminder) -> Date? {
   reminder.dueDateComponents.flatMap { Calendar.current.date(from: $0) }
 }
 
+func needsUpdate(_ reminder: EKReminder, airing: Airing) -> Bool {
+  dueDate(of: reminder) != airing.start
+    || reminder.dueDateComponents?.timeZone?.identifier != TimeZone.gmt.identifier
+}
+
 // MARK: - Sync
+
+func utcOffset(_ tz: TimeZone = .current) -> String {
+  let seconds = tz.secondsFromGMT()
+  let sign = seconds < 0 ? "-" : "+"
+  let hours = abs(seconds) / 3600
+  let minutes = abs(seconds) % 3600 / 60
+  if minutes == 0 { return "UTC\(sign)\(hours)" }
+  return String(format: "UTC%@%d:%02d", sign, hours, minutes)
+}
 
 func run() throws {
   let config = parseArgs()
 
   let store = EKEventStore()
   guard requestAccess(store) else {
-    fputs("error: reminders access denied\n", stderr)
-    exit(1)
+    throw Fail("reminders access denied (System Settings > Privacy & Security > Reminders)")
   }
 
-  let list = findList(store, name: config.reminderList)
+  let list = try findList(store, name: config.reminderList)
   print("list: \(list.title)")
-  print(
-    "timezone: \(TimeZone.current.identifier) "
-      + "(UTC\(TimeZone.current.secondsFromGMT() >= 0 ? "+" : "")"
-      + "\(TimeZone.current.secondsFromGMT() / 3600))\n")
+  print("timezone: \(TimeZone.current.identifier) (\(utcOffset()))\n")
 
-  let existing = fetchReminders(store, in: list)
+  let existing = try fetchReminders(store, in: list)
   let existingByTitle = Dictionary(
     existing.map { ($0.title ?? "", $0) },
     uniquingKeysWith: { first, _ in first }
@@ -284,14 +325,13 @@ func run() throws {
   var created = 0
   var updated = 0
   var skipped = 0
-  var replaced = 0
+  var deleted = 0
 
   for entry in entries {
     let media = entry.media
     let title = media.title.resolved(config.language)
-    let nodes = media.airingSchedule.nodes
 
-    guard !nodes.isEmpty else {
+    guard let airing = Airing(media.airingSchedule.nodes) else {
       print("  skip: \(title) (no upcoming episodes)")
       skipped += 1
       continue
@@ -299,9 +339,8 @@ func run() throws {
 
     if let existing = existingByTitle[title] {
       if config.force {
-        let newStart = Date(timeIntervalSince1970: TimeInterval(nodes.first!.airingAt))
-        if dueDate(of: existing) != newStart {
-          configureReminder(existing, media: media, nodes: nodes, fmt: fmt)
+        if needsUpdate(existing, airing: airing) {
+          configure(existing, media: media, airing: airing, fmt: fmt)
           try store.save(existing, commit: false)
           print("  update: \(title)")
           updated += 1
@@ -309,14 +348,7 @@ func run() throws {
           print("  skip: \(title) (up to date)")
           skipped += 1
         }
-        // Clean up reminders for the same show in a different language
-        if let dupes = existingByURL[media.siteUrl] {
-          for dupe in dupes where dupe.title != title {
-            try store.remove(dupe, commit: false)
-            print("  delete: \(dupe.title ?? "(untitled)") (duplicate)")
-            replaced += 1
-          }
-        }
+        deleted += try removeDuplicates(store, of: media, keeping: title, in: existingByURL)
       } else {
         print("  skip: \(title) (already exists)")
         skipped += 1
@@ -324,30 +356,23 @@ func run() throws {
       continue
     }
 
-    var isReplace = false
-    if config.force, let dupes = existingByURL[media.siteUrl], !dupes.isEmpty {
-      for dupe in dupes {
-        try store.remove(dupe, commit: false)
-      }
-      isReplace = true
-      replaced += 1
+    var removed = 0
+    if config.force {
+      removed = try removeDuplicates(store, of: media, keeping: title, in: existingByURL)
+      deleted += removed
     }
 
     let reminder = EKReminder(eventStore: store)
     reminder.calendar = list
     reminder.title = title
-    configureReminder(reminder, media: media, nodes: nodes, fmt: fmt)
+    configure(reminder, media: media, airing: airing, fmt: fmt)
     try store.save(reminder, commit: false)
-    if isReplace {
-      print("  replace: \(title)")
-    } else {
-      print("  add: \(title)")
-    }
+    print(removed > 0 ? "  replace: \(title)" : "  add: \(title)")
     created += 1
   }
 
   try store.commit()
-  print("\ndone: \(created) created, \(updated) updated, \(replaced) replaced, \(skipped) skipped")
+  print("\ndone: \(created) created, \(updated) updated, \(deleted) deleted, \(skipped) skipped")
 }
 
 do {
